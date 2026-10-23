@@ -39,13 +39,8 @@ package main
 import (
 	"context"
 	"fmt"
-	"net"
-	"net/url"
 	"os"
 	"strings"
-	"time"
-
-	"github.com/rs/zerolog/log"
 
 	"knative.dev/func-adapter-kafka/kafka"
 )
@@ -53,7 +48,6 @@ import (
 const (
 	defaultFunctionTarget = "http://127.0.0.1:8080/"
 	defaultListenAddress  = "[::]:8081"
-	targetWaitTimeout     = 60 * time.Second
 )
 
 func main() {
@@ -63,16 +57,10 @@ func main() {
 		os.Setenv("LISTEN_ADDRESS", defaultListenAddress)
 	}
 
-	target := functionTarget()
-
-	// Wait for the function to accept connections before consuming, so the
-	// first records aren't needlessly redelivered while it starts up.
-	if err := waitForTarget(target, targetWaitTimeout); err != nil {
-		fmt.Fprintln(os.Stderr, err.Error())
-		os.Exit(1)
-	}
-
-	svc, err := kafka.New(target)
+	// Start serves health immediately and waits for the function target before
+	// consuming, so a slow-starting function is not restart-looped by its
+	// liveness probe.
+	svc, err := kafka.New(functionTarget())
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
@@ -88,47 +76,4 @@ func functionTarget() string {
 		return v
 	}
 	return defaultFunctionTarget
-}
-
-// waitForTarget blocks until a TCP connection to the function target succeeds
-// or the timeout elapses.
-func waitForTarget(target string, timeout time.Duration) error {
-	u, err := url.Parse(target)
-	if err != nil {
-		return fmt.Errorf("invalid FUNCTION_TARGET %q: %w", target, err)
-	}
-	// Require an absolute http(s) URL with a host. url.Parse accepts a bare word
-	// ("myfunc") as a relative URL with an empty host, which would otherwise
-	// silently resolve to probing ":80" on localhost instead of failing fast on a
-	// misconfiguration.
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("invalid FUNCTION_TARGET %q: must be an absolute http or https URL", target)
-	}
-	if u.Hostname() == "" {
-		return fmt.Errorf("invalid FUNCTION_TARGET %q: missing host", target)
-	}
-
-	host := u.Host
-	if u.Port() == "" {
-		port := "80"
-		if u.Scheme == "https" {
-			port = "443"
-		}
-		host = net.JoinHostPort(u.Hostname(), port)
-	}
-
-	deadline := time.Now().Add(timeout)
-	for {
-		conn, err := net.DialTimeout("tcp", host, 2*time.Second)
-		if err == nil {
-			_ = conn.Close()
-			log.Info().Str("target", target).Msg("function target is reachable; starting consumer")
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out after %s waiting for function target %s: %w", timeout, target, err)
-		}
-		log.Info().Str("target", target).Msg("waiting for function target to become reachable")
-		time.Sleep(time.Second)
-	}
 }
